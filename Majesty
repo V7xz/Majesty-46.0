@@ -1,49 +1,60 @@
--- 🔐 SIMPLE KEY SYSTEM (XENO SAFE - NO HTTP)
--- ======================================================
+_G.KEY = "YOUR-KEY-HERE"
 
-local VALID_KEYS = {
-    ["ABC123"] = true,
-    ["TEST-KEY-999"] = true,
-    ["MAJESTY-ACCESS"] = true
-}
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
 
-local KEY = _G.KEY or ""
+local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
+
+local API = "https://https://nomographically-propatriotic-delia.ngrok-free.dev/validate"
 
 -- =========================
--- VALIDATE KEY
+-- REQUEST VALIDATION
 -- =========================
-local function validateKey()
-    if KEY == "" then
-        warn("❌ KEY TIDAK ADA")
+local function validate()
+    local body = HttpService:JSONEncode({
+        key = _G.KEY,
+        hwid = HWID
+    })
+
+    local response = request({
+        Url = API,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json"
+        },
+        Body = body
+    })
+
+    local data = HttpService:JSONDecode(response.Body)
+
+    if not data.success then
+        warn("❌ KEY INVALID: " .. (data.reason or "unknown"))
         return false
     end
 
-    if VALID_KEYS[KEY] then
-        print("✅ KEY VALID")
-        return true
-    else
-        warn("❌ KEY SALAH")
+    if data.hwidMismatch then
+        warn("❌ HWID MISMATCH")
         return false
     end
+
+    if data.expired then
+        warn("❌ KEY EXPIRED")
+        return false
+    end
+
+    print("✅ KEY VALID + HWID BOUND")
+    return true
 end
 
 -- =========================
--- EXECUTION GATE
+-- GATE
 -- =========================
-local VALID = validateKey()
-
-if not VALID then
-    warn("⛔ SCRIPT DIHENTIKAN")
+if not validate() then
     return
 end
 
--- ======================================================
--- 🚀 SCRIPT LANJUTAN (AMAN)
--- ======================================================
-
-print("🔥 SCRIPT BERHASIL JALAN")
-
--- lanjutkan script kamu di bawah sini
+print("🚀 SCRIPT LOADED SUCCESSFULLY")
 -- ========== MAJESTY STORE v8.3.0 ==========
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
