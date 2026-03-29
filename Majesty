@@ -160,15 +160,22 @@ local buyQty = {1, 1, 1}
 -- ================================================================
 local function countItem(name)
     local n = 0
-    for _,t in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if t.Name == name then n + = 1 end
-    end
-    local ch = LocalPlayer.Character
-    if ch then
-        for _,t in ipairs(ch:GetChildren()) do
-            if t:IsA("Tool") and t.Name == name then n += 1 end
+
+    for _, t in ipairs(LocalPlayer.Backpack:GetChildren()) do
+        if t.Name == name then
+            n = n + 1
         end
     end
+
+    local ch = LocalPlayer.Character
+    if ch then
+        for _, t in ipairs(ch:GetChildren()) do
+            if t:IsA("Tool") and t.Name == name then
+                n = n + 1
+            end
+        end
+    end
+
     return n
 end
 
