@@ -55,7 +55,7 @@ if not validate() then
 end
 
 print("🚀 SCRIPT LOADED SUCCESSFULLY")
--- ========== MAJESTY STORE v8.3.0 ==========
+-- ========== MAJESTY STORE v8.7.0 ==========
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local Workspace        = game:GetService("Workspace")
@@ -171,22 +171,15 @@ local buyQty = {1, 1, 1}
 -- ================================================================
 local function countItem(name)
     local n = 0
-
-    for _, t in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if t.Name == name then
-            n = n + 1
-        end
+    for _,t in ipairs(LocalPlayer.Backpack:GetChildren()) do
+        if t.Name == name then n += 1 end
     end
-
     local ch = LocalPlayer.Character
     if ch then
-        for _, t in ipairs(ch:GetChildren()) do
-            if t:IsA("Tool") and t.Name == name then
-                n = n + 1
-            end
+        for _,t in ipairs(ch:GetChildren()) do
+            if t:IsA("Tool") and t.Name == name then n += 1 end
         end
     end
-
     return n
 end
 
@@ -241,9 +234,20 @@ local function firePromptNearby(radius)
     if not root then return end
     for _,obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("ProximityPrompt") then
+            -- Cek parent langsung (BasePart) ATAU parent dari parent (NPC model)
             local part = obj.Parent
-            if part and part:IsA("BasePart") then
-                if (root.Position - part.Position).Magnitude <= (radius or 8) then
+            if part and not part:IsA("BasePart") then
+                part = part:FindFirstChildOfClass("BasePart") or part
+            end
+            local checkPart = part
+            if checkPart and checkPart:IsA("BasePart") then
+                if (root.Position - checkPart.Position).Magnitude <= (radius or 8) then
+                    pcall(function() fireproximityprompt(obj) end)
+                end
+            elseif part then
+                -- fallback: gunakan WorldPosition dari AncestorModel
+                local anchorPart = part:FindFirstChildWhichIsA("BasePart", true)
+                if anchorPart and (root.Position - anchorPart.Position).Magnitude <= (radius or 8) then
                     pcall(function() fireproximityprompt(obj) end)
                 end
             end
@@ -293,6 +297,12 @@ end
 local function waitRPC(instrType, timeout)
     local start = tick()
     while tick() - start < timeout do
+        -- PAUSE saat safe mode aktif (kabur)
+        while safeModeActive do
+            if not isRunning then return nil end
+            task.wait(0.5)
+        end
+        if not isRunning then return nil end
         for i = 1, #rpcQueue do
             local inst = rpcQueue[i]
             if inst and inst.type == instrType then
@@ -315,84 +325,216 @@ local function popTimer()
 end
 
 -- ================================================================
--- AUTO SELL ENGINE
+-- AUTO SELL ENGINE (v5 — improved detection, retry, validation)
 -- ================================================================
-local function doAutoSell(setStatus2)
-    local msTotal = countAllMS()
-    if msTotal == 0 then
-        setStatus2("Tidak ada MS", Color3.fromRGB(160,160,180))
-        return
+
+-- Validasi: apakah player sudah cukup dekat NPC penjual
+local function isNearNPC(radius)
+    local ch  = LocalPlayer.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    return (hrp.Position - NPC_MS_POS).Magnitude <= (radius or CFG.SELL_RADIUS + 5)
+end
+
+-- Tunggu hingga karakter stabil setelah teleport (tidak jatuh / bergerak cepat)
+local function waitCharacterStable(timeout)
+    local ch  = LocalPlayer.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then task.wait(1); return end
+    local deadline = tick() + (timeout or 2.5)
+    local lastPos  = hrp.Position
+    repeat
+        task.wait(0.25)
+        local delta = (hrp.Position - lastPos).Magnitude
+        lastPos = hrp.Position
+        if delta < 0.5 then return end   -- dianggap stabil
+    until tick() >= deadline
+end
+
+-- Equip dengan retry hingga berhasil atau timeout
+local function equipToolWithRetry(name, maxRetry)
+    for i = 1, (maxRetry or 5) do
+        local ok = equipTool(name)
+        if ok then
+            -- Pastikan tool benar-benar ada di tangan karakter
+            task.wait(0.3)
+            local ch = LocalPlayer.Character
+            if ch then
+                for _, t in ipairs(ch:GetChildren()) do
+                    if t:IsA("Tool") and t.Name == name then
+                        return true
+                    end
+                end
+            end
+        end
+        task.wait(0.4)
     end
-    setStatus2("Memulai jual "..msTotal.." MS...", Color3.fromRGB(50,210,110))
+    return false
+end
+
+-- Jual satu item: equip → hold E sampai selesai (1x interact untuk 1x item).
+-- Alur: equip → snapshot inv → hold E (tahan penuh) → tunggu inv berkurang → selesai.
+-- Tidak ada loop spamming E — 1 hold per 1 item supaya tidak tabrakan.
+local SELL_HOLD_DURATION = 1.8   -- durasi hold E (detik) — sesuaikan jika NPC butuh lebih lama
+local SELL_HOLD_RETRIES  = 5     -- max percobaan hold E jika item belum terjual
+
+local function trySellOne(msName, setStatus2)
+    -- Snapshot inventory sebelum aksi
+    local bS = countItem(CFG.ITEM_MS_SMALL)
+    local bM = countItem(CFG.ITEM_MS_MEDIUM)
+    local bL = countItem(CFG.ITEM_MS_LARGE)
+
+    setStatus2("Equip: "..msName.."...", Color3.fromRGB(100,180,255))
+    local equipped = equipToolWithRetry(msName, 4)
+    if not equipped then
+        setStatus2("Gagal equip "..msName, Color3.fromRGB(210,40,40))
+        unequipAll(); task.wait(0.4)
+        return false
+    end
+    -- Tunggu server kenali item di tangan
     task.wait(0.5)
 
-    local sold    = 0
-    local maxFail = 5
-    local fail    = 0
+    local sold = false
 
-    while countAllMS() > 0 do
-        local msName = getEquippableMS()
-        if not msName then break end
+    for attempt = 1, SELL_HOLD_RETRIES do
+        setStatus2(
+            "Jual: "..msName.." — Hold E ("..attempt.."/"..SELL_HOLD_RETRIES..")...",
+            Color3.fromRGB(50,210,110)
+        )
 
-        -- 1. Equip 1 bahan MS
-        setStatus2("Equip "..msName.."...", Color3.fromRGB(100,180,255))
-        local ok = equipTool(msName)
-        if not ok then
-            fail += 1
-            setStatus2("Gagal equip ("..fail.."/"..maxFail..")", Color3.fromRGB(210,40,40))
-            task.wait(1)
-            if fail >= maxFail then break end
-            continue
-        end
-        task.wait(0.5)  -- tunggu equip stabil
+        -- ── STEP 1: fireproximityprompt dulu untuk inisiasi prompt NPC ──
+        firePromptNearby(CFG.SELL_RADIUS + 5)
+        task.wait(0.1)
 
-        -- snapshot sebelum jual
-        local bS = countItem(CFG.ITEM_MS_SMALL)
-        local bM = countItem(CFG.ITEM_MS_MEDIUM)
-        local bL = countItem(CFG.ITEM_MS_LARGE)
-
-        -- 2. Tekan E sekali
-        setStatus2("Jual "..msName.."...", Color3.fromRGB(50,210,110))
+        -- ── STEP 2: Hold E secara penuh sampai selesai (tidak di-release sebelum waktunya) ──
         pcall(function()
-            VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
-            task.wait(0.15)
-            VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
         end)
-        task.wait(0.2)
-        -- backup: fire proximity kalau E tidak cukup
-        firePromptNearby(CFG.SELL_RADIUS)
 
-        -- 3. Tunggu inventory berubah (item terjual), max SELL_TIMEOUT detik
-        local elapsed = 0
-        local terjual = false
-        while elapsed < CFG.SELL_TIMEOUT do
+        -- Tahan E sambil cek inventory tiap 0.1 detik
+        local holdElapsed = 0
+        while holdElapsed < SELL_HOLD_DURATION do
+            task.wait(0.1)
+            holdElapsed += 0.1
+
             local diff = (bS - countItem(CFG.ITEM_MS_SMALL))
                        + (bM - countItem(CFG.ITEM_MS_MEDIUM))
                        + (bL - countItem(CFG.ITEM_MS_LARGE))
             if diff > 0 then
-                sold      += diff
+                -- Item terjual — lepas E langsung
+                pcall(function()
+                    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                end)
                 totalSold += diff
-                terjual    = true
-                fail       = 0
+                sold = true
                 break
             end
-            task.wait(0.3)
-            elapsed += 0.3
         end
 
-        -- 4. Unequip dulu sebelum iterasi berikutnya
-        unequipAll()
-        task.wait(0.3)
+        -- Pastikan E selalu dilepas setelah hold selesai
+        pcall(function()
+            VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        end)
 
-        if terjual then
-            setStatus2("Terjual "..sold.." | Sisa: "..countAllMS(), Color3.fromRGB(50,210,110))
-            task.wait(0.3)
+        if sold then break end
+
+        -- ── STEP 3: Jika belum terjual, cek sekali lagi setelah jeda singkat ──
+        task.wait(0.3)
+        local diff2 = (bS - countItem(CFG.ITEM_MS_SMALL))
+                    + (bM - countItem(CFG.ITEM_MS_MEDIUM))
+                    + (bL - countItem(CFG.ITEM_MS_LARGE))
+        if diff2 > 0 then
+            totalSold += diff2
+            sold = true
+            break
+        end
+
+        -- Belum terjual — coba lagi setelah jeda pendek
+        setStatus2(
+            "Belum terjual, retry ("..attempt.."/"..SELL_HOLD_RETRIES..")...",
+            Color3.fromRGB(255,155,35)
+        )
+        task.wait(0.4)
+    end
+
+    unequipAll()
+    task.wait(0.3)
+    return sold
+end
+
+local function doAutoSell(setStatus2)
+    -- ── VALIDASI: cek inventory ada MS sebelum mulai ──
+    local msTotal = countAllMS()
+    if msTotal == 0 then
+        setStatus2("Tidak ada MS di inventory", Color3.fromRGB(160,160,180))
+        task.wait(0.8)
+        return
+    end
+
+    setStatus2("Deteksi "..msTotal.." MS siap jual...", Color3.fromRGB(50,210,110))
+    task.wait(0.4)
+
+    -- ── VALIDASI: pastikan karakter sudah stabil setelah teleport ──
+    setStatus2("Stabilisasi posisi...", Color3.fromRGB(100,180,255))
+    waitCharacterStable(2.5)
+
+    -- ── VALIDASI: pastikan sudah dekat NPC ──
+    if not isNearNPC(CFG.SELL_RADIUS + 8) then
+        setStatus2("Terlalu jauh dari NPC, teleport ulang...", Color3.fromRGB(255,155,35))
+        fullyTeleport(NPC_MS_POS)
+        task.wait(1.2)
+        waitCharacterStable(2)
+    end
+
+    local sold       = 0
+    local maxFail    = 6
+    local fail       = 0
+    local maxTPRetry = 2
+    local tpRetry    = 0
+
+    while countAllMS() > 0 do
+        local msName = getEquippableMS()
+        if not msName then
+            setStatus2("Item MS tidak terdeteksi!", Color3.fromRGB(210,40,40))
+            break
+        end
+
+        setStatus2("["..countAllMS().." sisa] Proses: "..msName, Color3.fromRGB(100,180,255))
+
+        -- Jika terlalu jauh, re-teleport (maks 2x)
+        if not isNearNPC(CFG.SELL_RADIUS + 8) and tpRetry < maxTPRetry then
+            tpRetry += 1
+            setStatus2("Jauh dari NPC, TP ulang ("..tpRetry..")...", Color3.fromRGB(255,155,35))
+            fullyTeleport(NPC_MS_POS)
+            task.wait(1.2)
+            waitCharacterStable(2)
+            continue
+        end
+
+        local ok = trySellOne(msName, setStatus2)
+
+        if ok then
+            sold  += 1
+            fail   = 0
+            tpRetry = 0
+            setStatus2("Terjual! Total: "..sold.." | Sisa: "..countAllMS(), Color3.fromRGB(50,210,110))
+            task.wait(0.35)
         else
             fail += 1
-            setStatus2("Tidak terjual, retry ("..fail.."/"..maxFail..")", Color3.fromRGB(255,155,35))
+            setStatus2("Gagal jual ("..fail.."/"..maxFail..") — retry...", Color3.fromRGB(255,155,35))
             task.wait(0.8)
+
+            -- Setelah 2x gagal berturut-turut: re-equip + re-teleport
+            if fail >= 2 and fail % 2 == 0 then
+                setStatus2("Re-teleport ke NPC...", Color3.fromRGB(255,155,35))
+                unequipAll(); task.wait(0.3)
+                fullyTeleport(NPC_MS_POS)
+                task.wait(1.2)
+                waitCharacterStable(2)
+            end
+
             if fail >= maxFail then
-                setStatus2("Gagal jual. Pastikan dekat NPC!", Color3.fromRGB(210,40,40))
+                setStatus2("Gagal jual setelah "..maxFail.."x. Lanjut loop...", Color3.fromRGB(210,40,40))
                 break
             end
         end
@@ -400,9 +542,9 @@ local function doAutoSell(setStatus2)
 
     unequipAll()
     if sold > 0 then
-        setStatus2("Terjual "..sold.." MS (total: "..totalSold..")", Color3.fromRGB(50,210,110))
+        setStatus2("Jual selesai! "..sold.." MS | Total keseluruhan: "..totalSold, Color3.fromRGB(50,210,110))
     else
-        setStatus2("Tidak ada MS terjual. Pastikan dekat NPC!", Color3.fromRGB(255,155,35))
+        setStatus2("Tidak ada MS terjual. Periksa posisi NPC!", Color3.fromRGB(255,155,35))
     end
     task.wait(1)
 end
@@ -484,9 +626,17 @@ local function _setTimer(txt)
     if timerValue then timerValue.Text = txt end
 end
 
--- Countdown: tiap detik update phase+timer, berhenti jika AutoMS_Running & isRunning keduanya false
+-- Countdown: tiap detik update phase+timer.
+-- PAUSE otomatis saat safeModeActive = true (kabur ke safe spot).
+-- Berhenti (return false) hanya jika isRunning dimatikan secara eksplisit.
 local function countdown(secs, phaseTxt, color)
     for i = secs, 1, -1 do
+        if not isRunning then return false end
+        -- ── SAFE MODE PAUSE: tunggu sampai aman sebelum lanjut hitung mundur ──
+        while safeModeActive do
+            if not isRunning then return false end
+            task.wait(0.5)
+        end
         if not isRunning then return false end
         if statusValue then statusValue.Text = phaseTxt; statusValue.TextColor3 = color or Color3.fromRGB(0,255,136) end
         if phaseValue  then phaseValue.Text  = phaseTxt end
@@ -737,16 +887,39 @@ local function doAutoFully(setFullyStatus)
         if not fullyRunning then break end
 
         -- JUAL
-        setFullyStatus(cooked.." MS selesai! Siap jual...", Color3.fromRGB(52,210,110))
-        task.wait(0.2)
+        -- Validasi: cek dulu ada MS sebelum repot teleport
+        local msReady = countAllMS()
+        if msReady == 0 then
+            setFullyStatus("Tidak ada MS untuk dijual, skip jual...", Color3.fromRGB(255,155,35))
+            task.wait(1)
+        else
+            setFullyStatus(cooked.." MS selesai! Siap jual ("..msReady.." item)...", Color3.fromRGB(52,210,110))
+            task.wait(0.5)
 
-        setFullyStatus("Teleport ke NPC untuk jual...", Color3.fromRGB(52,210,110))
-        fullyTeleport(NPC_MS_POS)
-        if not fullyRunning then break end
+            -- Unequip semua dulu sebelum teleport jual
+            unequipAll()
+            task.wait(0.3)
 
-        setFullyStatus("Jual semua MS...", Color3.fromRGB(52,210,110))
-        doAutoSell(setFullyStatus)
-        if not fullyRunning then break end
+            setFullyStatus("Teleport ke NPC untuk jual...", Color3.fromRGB(52,210,110))
+            fullyTeleport(NPC_MS_POS)
+            -- Delay lebih panjang agar server sinkronisasi posisi setelah teleport
+            task.wait(1.8)
+            if not fullyRunning then break end
+
+            -- Verifikasi posisi: cek apakah sudah benar-benar dekat NPC
+            local ch2  = LocalPlayer.Character
+            local hrp2 = ch2 and ch2:FindFirstChild("HumanoidRootPart")
+            if hrp2 and (hrp2.Position - NPC_MS_POS).Magnitude > (CFG.SELL_RADIUS + 10) then
+                setFullyStatus("Posisi meleset, teleport ulang...", Color3.fromRGB(255,155,35))
+                fullyTeleport(NPC_MS_POS)
+                task.wait(1.5)
+            end
+
+            if not fullyRunning then break end
+            setFullyStatus("Jual semua MS ("..countAllMS().." item)...", Color3.fromRGB(52,210,110))
+            doAutoSell(setFullyStatus)
+            if not fullyRunning then break end
+        end
         task.wait(0.2)
 
         setFullyStatus("Loop berikutnya...", Color3.fromRGB(100,180,255))
@@ -814,7 +987,7 @@ titleLabel.TextColor3 = C.accent; titleLabel.Font = Enum.Font.Gotham; titleLabel
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left; titleLabel.Parent = titleBar
 local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(0,120,1,0); versionLabel.Position = UDim2.new(1,-165,0,0)
-versionLabel.BackgroundTransparency = 1; versionLabel.Text = "v8.3.0"
+versionLabel.BackgroundTransparency = 1; versionLabel.Text = "v8.7.0"
 versionLabel.TextColor3 = C.subtext; versionLabel.Font = Enum.Font.Gotham; versionLabel.TextSize = 10
 versionLabel.TextXAlignment = Enum.TextXAlignment.Left; versionLabel.Parent = titleBar
 local minBtn = Instance.new("TextButton")
@@ -1926,107 +2099,107 @@ UserInputService.InputBegan:Connect(function(input)
 end)
 
 -- ================================================================
--- SAFE MODE RUNTIME
+-- SAFE MODE RUNTIME  (v6 — full rewrite)
 -- ================================================================
-local SAFE_X,SAFE_Y,SAFE_Z = -534.245971679687, 14.356728553771973, 189.90879821777344
+
+local SAFE_X, SAFE_Y, SAFE_Z = -534.245971679687, 14.356728553771973, 189.90879821777344
+local SAFE_POS_VEC            = Vector3.new(SAFE_X, SAFE_Y, SAFE_Z)
+
+-- ── Cooldown guard: cegah re-trigger dalam 3 detik ──
+local _safeLastTrigger = 0
+local SAFE_COOLDOWN    = 3.0   -- detik minimum antar trigger
+
+-- ── Cook state snapshot (disimpan saat kabur) ──
+local SM = {
+    wasFullyRunning = false,   -- apakah auto fully sedang jalan saat dipicu
+    savedPhase      = nil,     -- fase masak terakhir
+    cookInProgress  = false,   -- apakah sedang di tengah siklus masak
+}
+
+-- ── Teleport INSTAN ke safe spot: paksa CFrame 3x berturut agar server sync ──
+-- Dipanggil langsung dari HealthChanged, tidak boleh ada delay di sini.
 local function tpToSafe()
-    local char = LocalPlayer.Character; if not char then return end
-    local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp  = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
     local hum2 = char:FindFirstChildOfClass("Humanoid")
     local seat = hum2 and hum2.SeatPart
+    local targetCF = CFrame.new(SAFE_X, SAFE_Y + 3, SAFE_Z)
+
     if seat then
         local vModel = seat:FindFirstAncestorWhichIsA("Model")
         if vModel and vModel.PrimaryPart then
-            local seatOff = vModel.PrimaryPart.CFrame:Inverse() * seat.CFrame
-            vModel:SetPrimaryPartCFrame(CFrame.new(SAFE_X,SAFE_Y+2,SAFE_Z)*seatOff:Inverse()); return
+            -- Paksa kendaraan ke safe 3x tanpa delay
+            for _ = 1, 3 do
+                pcall(function() vModel:SetPrimaryPartCFrame(targetCF) end)
+            end
+            return
         end
     end
-    hrp.CFrame = CFrame.new(SAFE_X, SAFE_Y+2, SAFE_Z)
-end
-local safeConn = nil
 
--- Cek apakah ada musuh dalam radius tertentu dari sebuah posisi
+    -- Paksa HRP ke safe 3x tanpa delay antar frame
+    for _ = 1, 3 do
+        pcall(function() hrp.CFrame = targetCF end)
+    end
+end
+
+-- ── Cek musuh dalam radius dari suatu posisi ──
 local function hasEnemyNear(pos, radius)
-    local myChar = LocalPlayer.Character
     for _, plr in pairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and not isWhitelisted(plr) then
-            local char = plr.Character
-            local hum  = char and char:FindFirstChildOfClass("Humanoid")
-            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-            if hum and hrp and hum.Health > 0 then
-                if (hrp.Position - pos).Magnitude <= radius then
-                    return true, plr.Name, math.floor((hrp.Position - pos).Magnitude)
+            local ch2  = plr.Character
+            local hum2 = ch2 and ch2:FindFirstChildOfClass("Humanoid")
+            local hrp2 = ch2 and ch2:FindFirstChild("HumanoidRootPart")
+            if hum2 and hrp2 and hum2.Health > 0 then
+                local dist = (hrp2.Position - pos).Magnitude
+                if dist <= radius then
+                    return true, plr.Name, math.floor(dist)
                 end
             end
         end
     end
-    return false
+    return false, nil, 0
 end
 
--- ================================================================
--- DETEKSI BAHAN BELUM DIMASUKKAN & RESUME MASAK
--- Logika: cek inventory bahan → masukkan yang kurang ke kompor
--- sesuai urutan fase, lalu lanjut masak normal
--- ================================================================
-
--- Fase masak yang bisa diresume:
--- "need_water"   → water belum masuk sama sekali
--- "need_sugar"   → water sudah masuk, tunggu/masukkan sugar
--- "need_gelatin" → sugar sudah masuk, tunggu/masukkan gelatin
--- "need_bag"     → gelatin sudah masuk, tinggal tunggu & ambil bag
--- "fresh"        → kompor kosong, mulai dari awal
-
-local function detectCookPhase()
-    local hasWater   = countItem(CFG.ITEM_WATER) >= 1
-    local hasSugar   = countItem(CFG.ITEM_SUGAR) >= 1
-    local hasGelatin = countItem(CFG.ITEM_GEL)   >= 1
-    local hasEmptyBag= countItem(CFG.ITEM_EMPTY)  >= 1
-
-    -- Cek rpcQueue untuk sinyal dari server tentang fase kompor saat ini
-    local phaseFromRPC = nil
-    for _, v in ipairs(rpcQueue) do
-        if v.type == "wait_boil"   then phaseFromRPC = "boiling"   break
-        elseif v.type == "add_sugar"   then phaseFromRPC = "add_sugar"  break
-        elseif v.type == "add_gelatin" then phaseFromRPC = "add_gelatin" break
-        elseif v.type == "wait_cook"   then phaseFromRPC = "cooking"    break
-        elseif v.type == "bag_result"  then phaseFromRPC = "bag_ready"  break
-        end
+-- ── Update label safe mode (aman jika lbl belum siap) ──
+local function setSafeLbl(msg, col)
+    if safeModeStatusLbl then
+        safeModeStatusLbl.Text       = msg
+        safeModeStatusLbl.TextColor3 = col or Color3.fromRGB(255,200,0)
     end
+end
 
-    -- Prioritas: gunakan sinyal RPC kalau ada
-    if phaseFromRPC == "add_sugar"   then return "need_sugar",   hasWater, hasSugar, hasGelatin end
-    if phaseFromRPC == "add_gelatin" then return "need_gelatin", hasWater, hasSugar, hasGelatin end
-    if phaseFromRPC == "bag_ready"   then return "need_bag",     hasWater, hasSugar, hasGelatin end
-    if phaseFromRPC == "boiling" or phaseFromRPC == "cooking" then
-        return "cooking_progress", hasWater, hasSugar, hasGelatin
+-- ── Snapshot fase masak saat ini berdasarkan inventory + rpcQueue ──
+local function detectCookPhase()
+    local hasWater    = countItem(CFG.ITEM_WATER) >= 1
+    local hasSugar    = countItem(CFG.ITEM_SUGAR) >= 1
+    local hasGelatin  = countItem(CFG.ITEM_GEL)   >= 1
+    local hasEmptyBag = countItem(CFG.ITEM_EMPTY)  >= 1
+
+    -- Prioritaskan sinyal RPC dari server (paling akurat)
+    for _, v in ipairs(rpcQueue) do
+        if     v.type == "wait_boil"   then return "need_sugar",       hasWater, hasSugar, hasGelatin
+        elseif v.type == "add_sugar"   then return "need_sugar",       hasWater, hasSugar, hasGelatin
+        elseif v.type == "add_gelatin" then return "need_gelatin",     hasWater, hasSugar, hasGelatin
+        elseif v.type == "wait_cook"   then return "cooking_progress", hasWater, hasSugar, hasGelatin
+        elseif v.type == "bag_result"  then return "need_bag",         hasWater, hasSugar, hasGelatin
+        end
     end
 
     -- Fallback: deduksi dari inventory
-    -- Kalau semua bahan masih ada = kompor belum diisi sama sekali
-    if hasWater and hasSugar and hasGelatin then
-        return "fresh", hasWater, hasSugar, hasGelatin
+    if     hasWater  and hasSugar  and hasGelatin  then return "fresh",            hasWater, hasSugar, hasGelatin
+    elseif not hasWater and hasSugar  and hasGelatin  then return "need_sugar",   hasWater, hasSugar, hasGelatin
+    elseif not hasWater and not hasSugar and hasGelatin  then return "need_gelatin", hasWater, hasSugar, hasGelatin
+    elseif not hasWater and not hasSugar and not hasGelatin then
+        if hasEmptyBag then return "need_bag",         hasWater, hasSugar, hasGelatin
+        else                return "cooking_progress", hasWater, hasSugar, hasGelatin end
     end
-    -- Water sudah masuk (tidak ada di inv), sugar & gelatin masih ada
-    if not hasWater and hasSugar and hasGelatin then
-        return "need_sugar", hasWater, hasSugar, hasGelatin
-    end
-    -- Water & sugar sudah masuk, gelatin masih ada
-    if not hasWater and not hasSugar and hasGelatin then
-        return "need_gelatin", hasWater, hasSugar, hasGelatin
-    end
-    -- Semua bahan sudah masuk, tinggal tunggu bag/masak
-    if not hasWater and not hasSugar and not hasGelatin then
-        if hasEmptyBag then
-            return "need_bag", hasWater, hasSugar, hasGelatin
-        else
-            return "cooking_progress", hasWater, hasSugar, hasGelatin
-        end
-    end
-
     return "unknown", hasWater, hasSugar, hasGelatin
 end
 
--- Resume masak dari fase yang terdeteksi, lalu lanjut normal
+-- ── Resume masak dari fase terdeteksi, lanjut normal setelahnya ──
 local function resumeCookFromPhase()
     local phase, hasWater, hasSugar, hasGelatin = detectCookPhase()
     isBusy = true
@@ -2036,9 +2209,11 @@ local function resumeCookFromPhase()
     local snapL = countItem(CFG.ITEM_MS_LARGE)
 
     _setStatus("Resume: "..phase, Color3.fromRGB(255,200,50))
+    _setPhase("Resume: "..phase)
 
-    -- ── FASE: kompor kosong / fresh → masukkan water dulu ──
+    -- FASE: kompor kosong → masukkan water
     if phase == "fresh" or phase == "need_water" then
+        if not isRunning then isBusy=false; return false end
         _setStatus("Masukkan Water...", Color3.fromRGB(100,180,255))
         _setPhase("Masukkan Water...")
         cookInteract(CFG.ITEM_WATER)
@@ -2046,51 +2221,54 @@ local function resumeCookFromPhase()
         for _ = 1, 30 do boilSecs = popTimer(); if boilSecs then break end; task.wait(0.1) end
         boilSecs = boilSecs or CFG.WATER_WAIT
         if not countdown(boilSecs, "Mendidih...", Color3.fromRGB(80,150,255)) then isBusy=false; return false end
-        phase = "need_sugar"  -- update fase
+        phase = "need_sugar"
     end
 
-    -- ── FASE: butuh sugar ──
+    -- FASE: butuh sugar
     if phase == "need_sugar" then
+        if not isRunning then isBusy=false; return false end
         _setStatus("Tunggu Sugar...", Color3.fromRGB(255,220,100))
         _setPhase("Tunggu Sugar...")
-        waitRPC("add_sugar", 12)
+        waitRPC("add_sugar", 15)
         if not isRunning then isBusy=false; return false end
         _setStatus("Masukkan Sugar...", Color3.fromRGB(255,220,100))
         _setPhase("Masukkan Sugar...")
         cookInteract(CFG.ITEM_SUGAR)
-        task.wait(0.3)
+        task.wait(0.4)
         phase = "need_gelatin"
     end
 
-    -- ── FASE: butuh gelatin ──
+    -- FASE: butuh gelatin
     if phase == "need_gelatin" then
+        if not isRunning then isBusy=false; return false end
         _setStatus("Tunggu Gelatin...", Color3.fromRGB(255,200,50))
         _setPhase("Tunggu Gelatin...")
-        waitRPC("add_gelatin", 12)
+        waitRPC("add_gelatin", 15)
         if not isRunning then isBusy=false; return false end
         _setStatus("Masukkan Gelatin...", Color3.fromRGB(255,200,50))
         _setPhase("Masukkan Gelatin...")
         cookInteract(CFG.ITEM_GEL)
-        task.wait(0.3)
+        task.wait(0.4)
         phase = "need_bag"
     end
 
-    -- ── FASE: semua bahan masuk, tunggu selesai masak ──
+    -- FASE: semua bahan sudah masuk, tunggu hasil masak
     if phase == "need_bag" or phase == "cooking_progress" then
+        if not isRunning then isBusy=false; return false end
         local cookSecs
         for _ = 1, 30 do cookSecs = popTimer(); if cookSecs then break end; task.wait(0.1) end
         cookSecs = cookSecs or CFG.COOK_WAIT
-        if not countdown(cookSecs, "Memasak...", Color3.fromRGB(80,140,255)) then isBusy=false; return false end
+        if not countdown(cookSecs, "Memasak (resume)...", Color3.fromRGB(80,140,255)) then isBusy=false; return false end
 
         _setStatus("Tunggu Bag...", Color3.fromRGB(100,160,255))
         _setPhase("Tunggu Bag...")
-        waitRPC("bag_result", 15)
+        waitRPC("bag_result", 18)
 
         local bag; local t2 = 0
         repeat
             bag = LocalPlayer.Backpack:FindFirstChild(CFG.ITEM_EMPTY)
             task.wait(0.3); t2 += 0.3
-        until bag or t2 > 12
+        until bag or t2 > 14
 
         if not bag then
             _setStatus("No Empty Bag!", Color3.fromRGB(255,60,90))
@@ -2106,14 +2284,14 @@ local function resumeCookFromPhase()
             newS = countItem(CFG.ITEM_MS_SMALL)  - snapS
             newM = countItem(CFG.ITEM_MS_MEDIUM) - snapM
             newL = countItem(CFG.ITEM_MS_LARGE)  - snapL
-        until (newS > 0 or newM > 0 or newL > 0) or waitMS > 8
+        until (newS > 0 or newM > 0 or newL > 0) or waitMS > 10
 
         if     newS > 0 then patStats.small  += newS
         elseif newM > 0 then patStats.medium += newM
         elseif newL > 0 then patStats.large  += newL
         else                 patStats.small  += 1 end
 
-        _setPhase("Resume Complete #"..totalMS())
+        _setPhase("Resume OK #"..totalMS())
         _setTimer("Done")
     end
 
@@ -2121,147 +2299,218 @@ local function resumeCookFromPhase()
     return true
 end
 
+-- ── Status label helper gabungan (MS + SafeMode) ──
+local function dualStatus(msg, col)
+    _setStatus(msg, col)
+    setSafeLbl(msg, col)
+end
+
+-- ================================================================
+-- SAFE MODE — TRIGGER UTAMA  (v7)
+-- Filosofi: PAUSE bukan STOP. Loop autofully tetap "jalan" di latar,
+-- tapi eksekusi di-pause via safeModeActive flag yang dicek countdown().
+-- Setelah aman → balik apart → lanjut masukkan bahan yang belum masuk.
+-- ================================================================
+local safeConn = nil
+
 local function triggerSafeEscape(newHP)
-    if not safeMode or safeModeActive then return end
+    -- Guard 1: safe mode harus aktif
+    if not safeMode then return end
+    -- Guard 2: tidak boleh trigger ulang saat sudah aktif
+    if safeModeActive then return end
+    -- Guard 3: cooldown antar trigger
+    local now = tick()
+    if now - _safeLastTrigger < SAFE_COOLDOWN then return end
+    -- Guard 4: harus damage nyata (HP turun)
     local dmg = math.floor(lastHealth - newHP)
     if dmg <= 0 then lastHealth = newHP; return end
-    safeModeActive = true; lastHealth = newHP
 
-    -- Stop masak sementara (baik auto ms maupun fully)
-    local wasFullyRunning = fullyRunning
-    if isRunning or fullyRunning then
-        isRunning = false
-        AutoMS_Running = false
-        fullyRunning = false
-        _setStatus("SAFE!", Color3.fromRGB(255,60,60))
-        if phaseValue then phaseValue.Text = "Kabur..." end
-    end
+    -- ── Kunci trigger ──
+    safeModeActive   = true
+    _safeLastTrigger = now
+    lastHealth       = newHP
 
-    if safeModeStatusLbl then
-        safeModeStatusLbl.Text = "HIT -"..dmg.."HP! KABUR..."
-        safeModeStatusLbl.TextColor3 = Color3.fromRGB(255,60,60)
-    end
+    -- Snapshot state (apakah fully sedang jalan?)
+    SM.wasFullyRunning = fullyRunning
+    SM.savedPhase, _   = detectCookPhase()
+    SM.cookInProgress  = isBusy
 
-    -- 1. Teleport ke safe spot
+    -- ── Update UI ──
+    _setStatus("⚠ HIT -"..dmg.."HP! KABUR!", Color3.fromRGB(255,40,40))
+    if phaseValue then phaseValue.Text = "Safe Mode..." end
+    setSafeLbl("⚠ HIT -"..dmg.."HP! KABUR KE SAFE SPOT...", Color3.fromRGB(255,40,40))
+
+    -- ── Teleport INSTAN — dilakukan SEKARANG (sinkron, sebelum task.spawn) ──
+    -- Ini memastikan karakter sudah berpindah sebelum frame berikutnya.
     tpToSafe()
+    -- Teleport kedua setelah satu frame untuk pastikan server terima
+    task.defer(tpToSafe)
 
+    -- ── Recovery goroutine (scan musuh, balik apart, resume) ──
     task.spawn(function()
-        task.wait(0.5)
-        if safeModeStatusLbl then safeModeStatusLbl.Text = "DI SAFE SPOT – CEK MUSUH..."; safeModeStatusLbl.TextColor3 = Color3.fromRGB(255,200,0) end
+        task.wait(0.15)  -- minimal stabilisasi, bukan 0.8
 
-        -- 2. Scan musuh via ESP di sekitar apartemen kita
-        local apartPos = fullySavedPos or Vector3.new(SAFE_X, SAFE_Y, SAFE_Z)
+        -- ═══════════════════════════════════════
+        -- FASE 1: TUNGGU AMAN DI SAFE SPOT
+        -- ═══════════════════════════════════════
+        setSafeLbl("DI SAFE SPOT – SCAN MUSUH...", Color3.fromRGB(255,200,0))
+
         local scanRadius = FULLY_ENEMY_RADIUS
-        local waitTick = tick()
-        local maxWait  = 20  -- max tunggu 20 detik
+        local waitStart  = tick()
+        local MAX_WAIT   = 45   -- tunggu max 45 detik
+        local clearCount = 0    -- butuh 3x scan bersih berturut → boleh balik
 
-        while tick() - waitTick < maxWait do
-            local enemyFound, enemyName, enemyDist = hasEnemyNear(apartPos, scanRadius)
-            if not enemyFound then
-                break
+        while tick() - waitStart < MAX_WAIT do
+            local myCh  = LocalPlayer.Character
+            local myHRP = myCh and myCh:FindFirstChild("HumanoidRootPart")
+            local scanCenter = myHRP and myHRP.Position or SAFE_POS_VEC
+
+            local enemyFound, enemyName, enemyDist = hasEnemyNear(scanCenter, scanRadius)
+
+            if enemyFound then
+                clearCount = 0
+                setSafeLbl(
+                    string.format("⚠ MUSUH: %s (%.0fm) — TAHAN...", enemyName, enemyDist),
+                    Color3.fromRGB(255,60,60)
+                )
+                if enemyDist < 12 then tpToSafe(); task.wait(0.5) end
+            else
+                clearCount += 1
+                setSafeLbl(
+                    string.format("Clear %d/3 — verifikasi aman...", clearCount),
+                    Color3.fromRGB(255,220,80)
+                )
+                if clearCount >= 3 then break end
             end
-            if safeModeStatusLbl then
-                safeModeStatusLbl.Text = string.format("MUSUH: %s (%.0fm) – TUNGGU...", enemyName, enemyDist)
-                safeModeStatusLbl.TextColor3 = Color3.fromRGB(255,80,80)
-            end
-            task.wait(1)
+            task.wait(1.2)
         end
 
-        -- 3. Aman – balik ke apartemen
+        -- ═══════════════════════════════════════
+        -- FASE 2: BALIK KE APARTEMEN
+        -- ═══════════════════════════════════════
         if fullySavedPos then
-            if safeModeStatusLbl then safeModeStatusLbl.Text = "AMAN – BALIK APART..."; safeModeStatusLbl.TextColor3 = Color3.fromRGB(100,255,180) end
+            setSafeLbl("AMAN – BALIK KE APARTEMEN...", Color3.fromRGB(100,255,180))
             fullyTeleport(fullySavedPos)
+            task.wait(1.8)
+
+            -- Verifikasi posisi
+            local myCh2  = LocalPlayer.Character
+            local myHRP2 = myCh2 and myCh2:FindFirstChild("HumanoidRootPart")
+            if myHRP2 and (myHRP2.Position - fullySavedPos).Magnitude > 8 then
+                fullyTeleport(fullySavedPos)
+                task.wait(1.2)
+            end
+        else
+            setSafeLbl("AMAN – Posisi apart belum tersimpan.", Color3.fromRGB(255,160,40))
             task.wait(1)
         end
 
-        -- ── 4. Deteksi fase masak & bahan yang belum dimasukkan ──
-        local phase, hasWater, hasSugar, hasGelatin = detectCookPhase()
+        -- ═══════════════════════════════════════
+        -- FASE 3: CEK MUSUH LAGI DI APART
+        -- ═══════════════════════════════════════
+        local apartPos = fullySavedPos or SAFE_POS_VEC
+        local ef2, en2, ed2 = hasEnemyNear(apartPos, scanRadius)
+        if ef2 then
+            setSafeLbl(
+                string.format("MUSUH MASIH DI APART: %s (%.0fm) – BALIK SAFE", en2, ed2),
+                Color3.fromRGB(255,80,80)
+            )
+            tpToSafe(); task.wait(2)
+            local st2 = tick()
+            while tick() - st2 < 20 do
+                local ef3, en3, ed3 = hasEnemyNear(apartPos, scanRadius)
+                if not ef3 then break end
+                setSafeLbl(string.format("Tunggu: %s (%.0fm)...", en3, ed3), Color3.fromRGB(255,80,80))
+                task.wait(1.5)
+            end
+            if fullySavedPos then fullyTeleport(fullySavedPos); task.wait(1.5) end
+        end
+
+        -- ═══════════════════════════════════════
+        -- FASE 4: RESET FLAG → loop lanjut otomatis
+        -- ═══════════════════════════════════════
+        local char3 = LocalPlayer.Character
+        local hum3  = char3 and char3:FindFirstChildOfClass("Humanoid")
+        if hum3 then lastHealth = hum3.Health end
+
+        -- ── Deteksi fase masak setelah kembali ke apart ──
+        local phase, hasW, hasS, hasG = detectCookPhase()
+
         local phaseDesc = {
-            fresh            = "KOMPOR KOSONG – MASAK DARI AWAL",
-            need_water       = "BELUM MASUKKAN WATER",
+            fresh            = "KOMPOR KOSONG",
             need_sugar       = "BELUM MASUKKAN SUGAR",
             need_gelatin     = "BELUM MASUKKAN GELATIN",
-            need_bag         = "SEMUA BAHAN MASUK – TUNGGU SELESAI",
-            cooking_progress = "SEDANG MASAK – LANJUT TUNGGU",
-            unknown          = "CEK KOMPOR...",
+            need_bag         = "TUNGGU SELESAI MASAK",
+            cooking_progress = "LANJUT MASAK",
+            unknown          = "CEK BAHAN...",
         }
-        local phaseColor = {
-            fresh            = Color3.fromRGB(100,180,255),
-            need_water       = Color3.fromRGB(100,180,255),
-            need_sugar       = Color3.fromRGB(255,220,100),
-            need_gelatin     = Color3.fromRGB(255,200,50),
-            need_bag         = Color3.fromRGB(80,220,130),
-            cooking_progress = Color3.fromRGB(80,140,255),
-            unknown          = Color3.fromRGB(160,160,180),
-        }
+        setSafeLbl("RESUME: "..(phaseDesc[phase] or phase), Color3.fromRGB(82,210,150))
 
-        if safeModeStatusLbl then
-            safeModeStatusLbl.Text       = phaseDesc[phase] or "CEK KOMPOR..."
-            safeModeStatusLbl.TextColor3 = phaseColor[phase] or C.subtext
-        end
-        task.wait(1)
+        -- ── Jika fully sedang jalan: lanjutkan dari fase (tanpa restart) ──
+        if SM.wasFullyRunning and safeMode then
 
-        -- ── 5. Update health & reset flag ──
-        local char2 = LocalPlayer.Character
-        local hum2  = char2 and char2:FindFirstChildOfClass("Humanoid")
-        if hum2 then lastHealth = hum2.Health end
-        safeModeActive = false
+            -- Jika loop sudah berhenti saat kabur (karena non-countdown path berhenti),
+            -- aktifkan kembali. Jika masih aktif (di-pause oleh countdown), biarkan.
+            if not isRunning then isRunning = true end
+            if not fullyRunning then fullyRunning = true end
 
-        -- ── 6. Resume masak dari fase yang terdeteksi ──
-        if wasFullyRunning and safeMode then
-            isRunning    = true
-            fullyRunning = true
-
-            local function dummyStatus(msg, col)
-                _setStatus(msg, col)
-                if safeModeStatusLbl then
-                    safeModeStatusLbl.Text       = msg
-                    safeModeStatusLbl.TextColor3 = col or C.accent
-                end
-            end
-
+            -- Lepas pause → countdown() akan lanjut sendiri
+            -- Tapi jika kita sedang di luar countdown (misal di waitRPC atau antara fase),
+            -- kita perlu interject: masukkan bahan yang belum masuk secara eksplisit.
+            -- Cek apakah ada bahan yang masih harus dimasukkan.
             task.spawn(function()
-                -- Kalau bahan masih ada di inventory → resume dari fase
-                if hasWater or hasSugar or hasGelatin or phase == "need_bag" or phase == "cooking_progress" then
-                    dummyStatus("Resume masak: "..phase, Color3.fromRGB(82,130,255))
-                    unequipAll()
-                    -- Masukkan bahan yang belum masuk dulu, lanjut masak satu siklus
-                    local ok = pcall(resumeCookFromPhase)
-                    -- Lanjut masak siklus-siklus berikutnya jika bahan masih ada
-                    while fullyRunning and hasAllIngredients() do
-                        pcall(doOneCook)
-                        if fullyRunning then task.wait(0.3) end
-                    end
-                    isRunning = false
-                    -- Setelah bahan habis → lanjut ke loop fully berikutnya (jual → beli → masak)
-                    if fullyRunning then
-                        task.spawn(function() doAutoFully(dummyStatus) end)
-                    end
-                else
-                    -- Bahan sudah habis semua di inventory (sudah masuk kompor semua atau habis dibeli)
-                    -- Langsung restart fully loop
-                    isRunning    = false
-                    fullyRunning = false
-                    task.wait(0.3)
-                    task.spawn(function() doAutoFully(dummyStatus) end)
+                task.wait(0.3)
+
+                -- ── Masukkan bahan yang belum masuk (interject cook) ──
+                unequipAll()
+
+                -- Sugar: jika masih di inventory dan kompor menunggu sugar
+                if phase == "need_sugar" and hasS then
+                    setSafeLbl("Masukkan Sugar...", Color3.fromRGB(255,220,100))
+                    _setStatus("Masukkan Sugar (resume)...", Color3.fromRGB(255,220,100))
+                    _setPhase("Masukkan Sugar...")
+                    cookInteract(CFG.ITEM_SUGAR)
+                    task.wait(0.5)
+                    phase = "need_gelatin"
                 end
+
+                -- Gelatin: jika masih di inventory dan kompor menunggu gelatin
+                if phase == "need_gelatin" and hasG then
+                    setSafeLbl("Masukkan Gelatin...", Color3.fromRGB(255,200,50))
+                    _setStatus("Masukkan Gelatin (resume)...", Color3.fromRGB(255,200,50))
+                    _setPhase("Masukkan Gelatin...")
+                    cookInteract(CFG.ITEM_GEL)
+                    task.wait(0.5)
+                end
+
+                -- Setelah bahan dimasukkan, baru release safeModeActive
+                -- agar countdown() yang di-pause bisa lanjut
+                safeModeActive = false
+                setSafeLbl("LANJUT MASAK...", Color3.fromRGB(0,255,136))
             end)
         else
-            if safeModeStatusLbl then
-                safeModeStatusLbl.Text       = "STANDBY"
-                safeModeStatusLbl.TextColor3 = C.accent
-            end
+            -- Fully tidak jalan → langsung release
+            safeModeActive = false
+            setSafeLbl("STANDBY", Color3.fromRGB(0,255,136))
         end
     end)
 end
+
+-- ── Hook health listener, re-hook saat respawn ──
 local function hookSafeMode(char)
-    local hum = char:WaitForChild("Humanoid", 10); if not hum then return end
+    local hum = char:WaitForChild("Humanoid", 10)
+    if not hum then return end
     lastHealth = hum.Health
-    if safeConn then safeConn:Disconnect() end
+    if safeConn then safeConn:Disconnect(); safeConn = nil end
     safeConn = hum.HealthChanged:Connect(triggerSafeEscape)
 end
 if LocalPlayer.Character then task.spawn(function() hookSafeMode(LocalPlayer.Character) end) end
-LocalPlayer.CharacterAdded:Connect(function(char) task.spawn(function() hookSafeMode(char) end) end)
+LocalPlayer.CharacterAdded:Connect(function(char)
+    safeModeActive   = false
+    _safeLastTrigger = 0
+    SM.wasFullyRunning = false
+    task.spawn(function() hookSafeMode(char) end)
+end)
 
 -- ================================================================
 -- ESP RENDER LOOP
@@ -2390,5 +2639,5 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
-print("=== MAJESTY STORE v8.3.0 LOADED ===")
+print("=== MAJESTY STORE v8.7.0 LOADED ===")
 print("discord.gg/VPeZbhCz8M")
