@@ -30,17 +30,7 @@ local function validate()
     local data = HttpService:JSONDecode(response.Body)
 
     if not data.success then
-        warn("❌ KEY INVALID: " .. (data.reason or "unknown"))
-        return false
-    end
-
-    if data.hwidMismatch then
-        warn("❌ HWID MISMATCH")
-        return false
-    end
-
-    if data.expired then
-        warn("❌ KEY EXPIRED")
+        warn("❌ KEY INVALID: " .. (data.message or "unknown"))
         return false
     end
 
