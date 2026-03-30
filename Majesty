@@ -1,4 +1,3 @@
-```
 G.KEY = "YOUR-KEY-HERE"
 
 local HttpService = game:GetService("HttpService")
