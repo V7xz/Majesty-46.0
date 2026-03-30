@@ -6,7 +6,8 @@ local LocalPlayer = Players.LocalPlayer
 
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
 
-local API = "majesty-obfuscate-v2-production.up.railway.app"
+local API = "https://majesty-obfuscate-v2-production.up.railway.app/validate"
+
 
 -- =========================
 -- REQUEST VALIDATION
