@@ -6,7 +6,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
 
-local API = "https://nomographically-propatriotic-delia.ngrok-free.dev/validate"
+local API = "majesty-obfuscate-v2-production.up.railway.app"
 
 -- =========================
 -- REQUEST VALIDATION
