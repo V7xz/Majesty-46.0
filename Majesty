@@ -1,4 +1,4 @@
-_G.KEY = "YOUR-KEY-HERE"
+_G.KEY = _G.KEY or "YOUR-KEY-HERE"
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
@@ -7,7 +7,6 @@ local LocalPlayer = Players.LocalPlayer
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
 
 local API = "https://majesty-obfuscate-v2-production.up.railway.app/validate"
-
 
 -- =========================
 -- REQUEST VALIDATION
