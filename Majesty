@@ -3,9 +3,7 @@ G.KEY = "YOUR-KEY-HERE"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
-
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
-
 local API = "https://https://nomographically-propatriotic-delia.ngrok-free.dev/validate"
 
 -- =========================
