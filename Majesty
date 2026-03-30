@@ -1,4 +1,4 @@
-_G.KEY = "YOUR-KEY-HERE"
+_G.KEY = "5U20-YJYO-INHW-EPJT"
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
