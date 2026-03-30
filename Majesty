@@ -55,7 +55,6 @@ if not validate() then
 end
 
 print("🚀 SCRIPT LOADED SUCCESSFULLY")
-```
 -- ========== MAJESTY STORE v8.7.0 ==========
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
